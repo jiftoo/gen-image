@@ -1,0 +1,15 @@
+[package]
+name = "gen-image"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.69"
+eframe = "0.21.3"
+egui = "0.21.0"
+glium = "0.32.1"
+image = "0.24.5"
+rand = "0.8.5"
+rfd = "0.11.2"
