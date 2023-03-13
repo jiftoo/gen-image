@@ -4,6 +4,8 @@ use std::{
 	fs,
 	io::Cursor,
 	path::{Path, PathBuf},
+	sync::Arc,
+	thread,
 };
 
 use egui::{Color32, ColorImage, ImageData, Pos2, Rect, Stroke, TextureHandle, Vec2};
@@ -186,7 +188,7 @@ use rand::{prelude::Distribution, Rng};
 #[derive(Clone, Copy, Debug)]
 struct Vertex {
 	position: [f32; 2],
-	color_rgba: [f32; 4],
+	color_rgba: [u8; 4],
 }
 implement_vertex!(Vertex, position, color_rgba);
 
@@ -217,17 +219,18 @@ fn gen_vertices(n_triangles: usize) -> Vec<Vertex> {
 
 	let mut vertices = Vec::with_capacity(n_triangles * 3);
 
-	let mut color = [0.0f32; 4];
+	let mut color = [0; 4];
 	for i in 0..(n_triangles * 3) {
 		let x = ((h.rand() % 200000) as i64 - 100000) as f32 / 100000.0;
 		let y = ((h.rand() % 200000) as i64 - 100000) as f32 / 100000.0;
 		if i % 3 == 0 {
 			color = [
 				// todo: move to randnormfloat()
-				(h.rand() % 100000) as f32 / 100000.0,
-				(h.rand() % 100000) as f32 / 100000.0,
-				(h.rand() % 100000) as f32 / 100000.0,
-				(h.rand() % 100000) as f32 / 100000.0,
+				// (h.rand() % 100000) as f32 / 100000.0,
+				// (h.rand() % 100000) as f32 / 100000.0,
+				// (h.rand() % 100000) as f32 / 100000.0,
+				// (h.rand() % 100000) as f32 / 100000.0,
+				0, 0, 0, 0,
 			];
 		}
 		let vertex = Vertex {
@@ -240,28 +243,31 @@ fn gen_vertices(n_triangles: usize) -> Vec<Vertex> {
 	vertices
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-struct DiffComputeOutput {
-	sq_diff: f32,
-}
-implement_uniform_block!(DiffComputeOutput, sq_diff);
+// #[repr(C)]
+// #[derive(Clone, Copy, Debug)]
+// struct DiffComputeOutput {
+// 	sq_diff: [f32; 256 * 256],
+// }
+// implement_uniform_block!(DiffComputeOutput, sq_diff);
 
 struct LossComputeProgram {
 	compute_program: glium::program::ComputeShader,
-	uniform_buffer: glium::uniforms::UniformBuffer<DiffComputeOutput>,
+	diff_texture: glium::texture::Texture2d,
+	// uniform_buffer: glium::uniforms::UniformBuffer<[u32; 256*256]>,
 }
 
 impl LossComputeProgram {
-	fn build(display: &glium::Display) -> Self {
+	fn build(display: &glium::Display, width: u32, height: u32) -> Self {
 		let compute_shader_src = r#"
-		#version 430
+		#version 440
 
 		layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 
-		layout(std140, location = 1) buffer Output {
-			float sq_diff;
-		};
+		// layout(std140) buffer Output {
+		// 	uint sq_diff[];
+		// };
+
+		layout(r32f) writeonly uniform image2D diff_texture;
 
 		layout(rgba8) readonly uniform image2D current_image;
 		layout(rgba8) readonly uniform image2D reference_image;
@@ -269,22 +275,42 @@ impl LossComputeProgram {
 		void main() {
 			// why does imageLoad accept ivec and not uvec?
 
-			vec4 rgba = imageLoad(current_image, ivec2(gl_GlobalInvocationID.xy));
-			vec4 ref_rgba = imageLoad(reference_image, ivec2(gl_GlobalInvocationID.xy));
-			float diff = dot(ref_rgba.rgb - rgba.rgb, vec3(1, 1, 1));
-			sq_diff += diff * diff;
+			// uvec4 rgba = uvec4(imageLoad(current_image, ivec2(gl_GlobalInvocationID.xy)) * 100.0);
+			// uvec4 ref_rgba = uvec4(imageLoad(reference_image, ivec2(gl_GlobalInvocationID.xy)) * 100.0);
+
+            vec3 rgba = imageLoad(current_image, ivec2(gl_GlobalInvocationID.xy)).rgb;
+            vec3 ref_rgba = imageLoad(reference_image, ivec2(gl_GlobalInvocationID.xy)).rgb;
+            vec3 diff = rgba - ref_rgba;
+
+            // uint rd = rgba.r - ref_rgba.r;
+            // uint gd = rgba.g - ref_rgba.g;
+            // uint bd = rgba.b - ref_rgba.b;
+            // atomicAdd(sq_diff, rd * rd + gd * gd + bd * bd);
+
+            // atomicAdd(sq_diff, uint(dot(diff, diff) * 100));
+
+            imageStore(diff_texture, ivec2(gl_GlobalInvocationID.xy), vec4(dot(diff, diff)));
 		}
 	"#;
 
-		let uniform_buffer =
-			glium::uniforms::UniformBuffer::<DiffComputeOutput>::empty_dynamic(display).unwrap();
+		// let uniform_buffer =
+		// 	glium::uniforms::UniformBuffer::<[u32; 256*256]>::empty_dynamic(display).unwrap();
+
+		let diff_texture = glium::texture::Texture2d::empty_with_format(
+			display,
+			glium::texture::UncompressedFloatFormat::U8U8U8U8,
+			glium::texture::MipmapsOption::NoMipmap,
+			width,
+			height,
+		)
+		.unwrap();
 
 		let compute_program =
 			glium::program::ComputeShader::from_source(display, compute_shader_src).unwrap();
 
 		LossComputeProgram {
 			compute_program,
-			uniform_buffer,
+			diff_texture, // uniform_buffer,
 		}
 	}
 
@@ -295,17 +321,22 @@ impl LossComputeProgram {
 		assert!(w == reference.width());
 		assert!(h == reference.height());
 
-		self.uniform_buffer
-			.write(&DiffComputeOutput { sq_diff: 0.0 });
+		// self.uniform_buffer.invalidate();
 		let uniforms = glium::uniform! {
-			Output: &self.uniform_buffer,
+			// Output: &self.uniform_buffer,
+			diff_texture: self.diff_texture.image_unit(glium::uniforms::ImageUnitFormat::R32F).unwrap(),
 			current_image: current.image_unit(glium::uniforms::ImageUnitFormat::RGBA8).unwrap(),
 			reference_image: reference.image_unit(glium::uniforms::ImageUnitFormat::RGBA8).unwrap(),
 		};
 
 		self.compute_program.execute(uniforms, w, h, 1);
 
-		self.uniform_buffer.read().unwrap().sq_diff
+		let pixels: Vec<Vec<(u8, u8, u8, u8)>> = self.diff_texture.read();
+		pixels
+			.into_iter()
+			.flatten()
+			.map(|x| f32::from_ne_bytes([x.0, x.1, x.2, x.3]))
+			.sum::<f32>()
 	}
 }
 
@@ -313,9 +344,8 @@ struct PolygonRenderer<'a> {
 	display: &'a glium::Display,
 	width: u32,
 	height: u32,
-	reference_image: glium::texture::Texture2d,
+	reference_image: &'a glium::texture::Texture2d,
 	vbo: glium::VertexBuffer<Vertex>,
-	vbo_size: usize,
 	draw_program: glium::program::Program,
 	compute_program: LossComputeProgram,
 }
@@ -325,8 +355,8 @@ impl<'a> PolygonRenderer<'a> {
 		display: &'a glium::Display,
 		width: u32,
 		height: u32,
-		max_polygons: usize,
-		reference_image: glium::texture::Texture2d,
+		polygons: &[Vertex],
+		reference_image: &'a glium::texture::Texture2d,
 	) -> Self {
 		let vertex_shader_src = r#"
 		#version 430
@@ -365,10 +395,9 @@ impl<'a> PolygonRenderer<'a> {
 			width,
 			height,
 			reference_image,
-			vbo_size: 0,
-			vbo: glium::VertexBuffer::empty_dynamic(display, max_polygons * 3).unwrap(),
+			vbo: glium::VertexBuffer::dynamic(display, polygons).unwrap(),
 			draw_program: program,
-			compute_program: LossComputeProgram::build(display),
+			compute_program: LossComputeProgram::build(display, width, height),
 		}
 	}
 
@@ -383,18 +412,17 @@ impl<'a> PolygonRenderer<'a> {
 		.unwrap()
 	}
 
-	fn update_polygons(&mut self, polygons: &Vec<Vertex>) {
-		self.vbo.invalidate();
-		self.vbo.slice(0..polygons.len()).unwrap().write(polygons);
-		self.vbo_size = polygons.len();
+	fn update_polygon(&mut self, base: usize, polygons: &[Vertex]) {
+		let slice = self.vbo.slice(base..(base + 3)).unwrap();
+		slice.invalidate();
+		slice.write(polygons);
 	}
 
 	fn clear_draw_polygons(&self, target: &mut glium::framebuffer::SimpleFrameBuffer) {
-		let slice = self.vbo.slice(0..self.vbo_size).unwrap();
-		target.clear_color(0.0, 0.0, 0.0, 0.0);
+		target.clear_color(1.0, 1.0, 1.0, 1.0);
 		target
 			.draw(
-				slice,
+				&self.vbo,
 				glium::index::NoIndices(glium::index::PrimitiveType::TrianglesList),
 				&self.draw_program,
 				&glium::uniforms::EmptyUniforms,
@@ -408,7 +436,7 @@ impl<'a> PolygonRenderer<'a> {
 
 	fn calculate_loss(&self, current: &glium::texture::Texture2d) -> f32 {
 		self.compute_program
-			.compute_loss(current, &self.reference_image)
+			.compute_loss(current, self.reference_image)
 	}
 }
 
@@ -447,72 +475,65 @@ impl Population {
 		}
 	}
 
-	fn mutate(&mut self) -> &Vec<Vertex> {
-		let base = self.rand.rand() as usize % (self.members.len() / 3) * 3;
-		let v123: &mut [Vertex; 3] = &mut self.members[base..(base + 3)].try_into().unwrap();
+	fn mutate_color(&mut self, base: usize) {
+		let v123 = &mut self.members[base..(base + 3)];
 
-		self.mutation_backup = Some((base, *v123));
+		let rnd = self.rand.rand();
+		let rnd_a = (self.rand.rand() % 256) as u8;
 
-		v123.copy_from_slice(&gen_vertices(1));
-
-		// let [v1, v2, v3] = v123;
-
-		// let judgement = self.rand.rand() % 10;
-		// let mentjudge = (self.rand.rand() % 3) as usize;
-		// let f = self.rand.randnormfloat();
-		// if judgement <= 2 {
-		// 	v1.color_rgba[mentjudge] = f;
-		// 	v2.color_rgba[mentjudge] = f;
-		// 	v3.color_rgba[mentjudge] = f;
-		// } else {
-		// 	let third = (self.rand.rand() % 2) as usize;
-		// 	v123[mentjudge].position[third] = f * 2.0 - 1.0;
-		// }
-
-		&self.members
+		v123[0].color_rgba[(rnd % 3) as usize] = rnd_a;
+		v123[1].color_rgba[(rnd % 3) as usize] = rnd_a;
+		v123[2].color_rgba[(rnd % 3) as usize] = rnd_a;
 	}
 
-	fn restore(&mut self) {
+	fn mutate_coord(&mut self, base: usize) {
+		let v123 = &mut self.members[base..(base + 3)];
+
+		let rnd = self.rand.rand();
+		let rnd_a = self.rand.rand();
+		let rnd_f = self.rand.randnormfloat();
+
+		v123[(rnd % 3) as usize].position[(rnd_a % 2) as usize] = rnd_f * 2.0 - 1.0;
+	}
+
+	fn mutate_alpha(&mut self, base: usize) {
+		let v123 = &mut self.members[base..(base + 3)];
+		let rnd_a = (self.rand.rand() % 256) as u8;
+
+		v123[0].color_rgba[3] = rnd_a;
+		v123[1].color_rgba[3] = rnd_a;
+		v123[2].color_rgba[3] = rnd_a;
+	}
+
+	fn mutate(&mut self) -> (&[Vertex], usize) {
+		let base = self.rand.rand() as usize % (self.members.len() / 3) * 3;
+
+		let v123 = &self.members[base..(base + 3)];
+		self.mutation_backup = Some((base, [v123[0], v123[1], v123[2]]));
+
+		let rnd = self.rand.rand() % 16;
+
+		if rnd <= 2 {
+			self.mutate_color(base);
+		} else if rnd <= 8 {
+			self.mutate_coord(base);
+		} else {
+			self.mutate_alpha(base);
+		}
+
+		(&self.members[base..(base + 3)], base)
+	}
+
+	fn restore(&mut self) -> (&[Vertex], usize) {
 		if let Some(backup) = self.mutation_backup.take() {
 			self.members[backup.0..(backup.0 + 3)].copy_from_slice(&backup.1);
 			self.mutation_backup = None;
+
+			(&self.members[backup.0..(backup.0 + 3)], backup.0)
 		} else {
 			unreachable!("restore called without backup");
 		}
 	}
-
-	// fn mutate(&mut self) -> &Vec<Vertex> {
-	// 	for chunk in self.members.chunks_exact_mut(3) {
-	// 		let rnd = self.rand.rand() % 10;
-	// 		if rnd <= 3 {
-	// 			let v = gen_vertices(1);
-	// 			chunk[0] = v[0];
-	// 			chunk[1] = v[1];
-	// 			chunk[2] = v[2];
-	// 		}
-	// 	}
-
-	// 	self.mutation_backup = Some(self.members.clone());
-
-	// 	&self.members
-	// }
-
-	// fn restore(&mut self) {
-	// 	if let Some(backup) = self.mutation_backup.take() {
-	// 		self.members = backup;
-	// 	} else {
-	// 		unreachable!("restore called without backup");
-	// 	}
-	// }
-}
-
-fn prepare_gl_context(width: u32, height: u32) -> glium::Display {
-	let event_loop = glutin::event_loop::EventLoop::new();
-	let wb = glutin::window::WindowBuilder::new()
-		.with_visible(false)
-		.with_inner_size(glutin::dpi::PhysicalSize::new(width, height));
-	let cb = glutin::ContextBuilder::new();
-	glium::Display::new(wb, cb, &event_loop).unwrap()
 }
 
 fn load_file_to_texutre(
@@ -521,8 +542,15 @@ fn load_file_to_texutre(
 ) -> glium::texture::Texture2d {
 	let image = image::open(path).unwrap().to_rgba8();
 	let image_dimensions = image.dimensions();
-	let image = glium::texture::RawImage2d::from_raw_rgba(image.into_raw(), image_dimensions);
-	glium::texture::Texture2d::new(display, image).unwrap()
+	let image =
+		glium::texture::RawImage2d::from_raw_rgba_reversed(&image.into_raw(), image_dimensions);
+	glium::texture::Texture2d::with_format(
+		display,
+		image,
+		glium::texture::UncompressedFloatFormat::U8U8U8U8,
+		glium::texture::MipmapsOption::NoMipmap,
+	)
+	.unwrap()
 }
 
 fn texture_to_scale(
@@ -532,7 +560,7 @@ fn texture_to_scale(
 	dest_height: u32,
 ) -> glium::Texture2d {
 	let passthrough_compute = r#"
-		#version 430
+		#version 440
 
 		layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 
@@ -582,42 +610,177 @@ fn texture_to_scale(
 	dest_texture
 }
 
+struct IdentityDrawer {
+	program: glium::program::Program,
+	vbo: glium::VertexBuffer<Vertex>,
+	inner_size: (f32, f32),
+}
+
+impl IdentityDrawer {
+	fn new(display: &glium::Display) -> Self {
+		let vertex_shader_src = r#"
+            #version 430
+
+            in vec2 position;
+            in vec4 color_rgba;
+
+            void main() {
+                gl_Position = vec4(position, 0.0, 1.0);
+            }
+	    "#;
+		let fragment_shader_src = r#"
+            #version 430
+
+            out vec4 color_out;
+
+            uniform sampler2D tex;
+            uniform vec2 inner_size;
+
+            void main() {
+                color_out = texture(tex, gl_FragCoord.xy / inner_size);
+            }
+	    "#;
+
+		let program = glium::program::Program::from_source(
+			display,
+			vertex_shader_src,
+			fragment_shader_src,
+			None,
+		)
+		.unwrap();
+
+		let vbo = glium::VertexBuffer::new(
+			display,
+			&[
+				Vertex {
+					position: [-1.0, -1.0],
+					color_rgba: [0, 0, 0, 0],
+				},
+				Vertex {
+					position: [1.0, -1.0],
+					color_rgba: [0, 0, 0, 0],
+				},
+				Vertex {
+					position: [1.0, 1.0],
+					color_rgba: [0, 0, 0, 0],
+				},
+				Vertex {
+					position: [-1.0, -1.0],
+					color_rgba: [0, 0, 0, 0],
+				},
+				Vertex {
+					position: [1.0, 1.0],
+					color_rgba: [0, 0, 0, 0],
+				},
+				Vertex {
+					position: [-1.0, 1.0],
+					color_rgba: [0, 0, 0, 0],
+				},
+			],
+		)
+		.unwrap();
+
+		let size = display.gl_window().window().inner_size();
+
+		Self {
+			program,
+			vbo,
+			inner_size: (size.width as f32, size.height as f32),
+		}
+	}
+
+	fn draw_texture(&self, frame: &mut glium::Frame, tex: &glium::Texture2d) {
+		frame
+			.draw(
+				&self.vbo,
+				glium::index::NoIndices(glium::index::PrimitiveType::TrianglesList),
+				&self.program,
+				&glium::uniform! {
+					tex: tex.sampled(),
+					inner_size: self.inner_size
+				},
+				&glium::DrawParameters {
+					blend: glium::Blend::alpha_blending(),
+					..Default::default()
+				},
+			)
+			.unwrap();
+	}
+}
+
 fn main() {
 	const WIDTH: u32 = 256;
 	const HEIGHT: u32 = 256;
-	let display = prepare_gl_context(WIDTH, HEIGHT);
+
+	let event_loop = glutin::event_loop::EventLoop::new();
+	let wb = glutin::window::WindowBuilder::new()
+		.with_visible(true)
+		.with_inner_size(glutin::dpi::PhysicalSize::new(WIDTH, HEIGHT));
+	let cb = glutin::ContextBuilder::new();
+	let display = glium::Display::new(wb, cb, &event_loop).unwrap();
 
 	let reference_image = load_file_to_texutre(&display, "input.png");
 	let reference_image = texture_to_scale(&display, &reference_image, WIDTH, HEIGHT);
 
-	let mut population = Population::random(256);
+	let mut population = Population::random(50);
 
-	let mut renderer = PolygonRenderer::build(&display, WIDTH, HEIGHT, 256, reference_image);
+	let mut renderer = PolygonRenderer::build(
+		&display,
+		WIDTH,
+		HEIGHT,
+		&population.members,
+		&reference_image,
+	);
 	let texture = renderer.gen_texture();
 	let mut framebuffer = texture.as_surface();
 
-	renderer.update_polygons(&population.members);
+	let identity_drawer = IdentityDrawer::new(&display);
+
 	renderer.clear_draw_polygons(&mut framebuffer);
 
 	let mut current_loss = renderer.calculate_loss(&texture);
+	let mut good_mutations = 0;
+	let mut bad_mutations = 0;
 	for i in 0..100000 {
-		let mutated_population = population.mutate();
+		let (mutated_vertices, base) = population.mutate();
 
-		renderer.update_polygons(mutated_population);
+		// let fence = glium::SyncFence::new(&display).unwrap();
+		renderer.update_polygon(base, mutated_vertices);
 		renderer.clear_draw_polygons(&mut framebuffer);
+		// fence.wait();
 
+		// let fence = glium::SyncFence::new(&display).unwrap();
 		let loss = renderer.calculate_loss(&texture);
+		// fence.wait();
+		// thread::sleep(Duration::from_secs(1));
 
 		if loss > current_loss {
-			population.restore();
+			let (restored_vertices, base) = population.restore();
+			renderer.update_polygon(base, restored_vertices);
+			bad_mutations += 1;
 		} else {
 			current_loss = loss;
-			let image_buffer = build_image_buffer(&texture);
-			image_buffer.save(format!("test{i}.png")).unwrap();
-			println!("loss: {}", loss);
+			good_mutations += 1;
+			// let image_buffer = build_image_buffer(&texture);
+			// image_buffer.save(format!("test{i}.png")).unwrap();
 		}
-	}
 
+		// println!("loss: {loss}, good: {good_mutations}, bad: {bad_mutations}");
+
+		let mut frame = display.draw();
+		frame.clear_color(1.0, 1.0, 1.0, 1.0);
+		// identity_drawer.draw_texture(&mut frame, &reference_image);
+		identity_drawer.draw_texture(&mut frame, &texture);
+		frame.finish().unwrap();
+
+		display
+			.gl_window()
+			.window()
+			.set_title(&format!("gen: {i}, loss: {current_loss}"));
+
+		// thread::sleep(Duration::from_millis(10));
+		// println!("loss: {}", loss);
+	}
 
 	// let shape = gen_vertices(128);
 
