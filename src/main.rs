@@ -230,9 +230,10 @@ fn gen_vertices(n_triangles: usize) -> Vec<Vertex> {
 				// (h.rand() % 100000) as f32 / 100000.0,
 				// (h.rand() % 100000) as f32 / 100000.0,
 				// (h.rand() % 100000) as f32 / 100000.0,
-				0, 0, 0, 0,
+				0, 0, 0, 255,
 			];
 		}
+
 		let vertex = Vertex {
 			position: [x, y],
 			color_rgba: color,
@@ -314,6 +315,7 @@ impl LossComputeProgram {
 		}
 	}
 
+	#[inline]
 	fn compute_loss(&self, current: &glium::Texture2d, reference: &glium::Texture2d) -> f32 {
 		let w = current.width();
 		let h = current.height();
@@ -362,12 +364,12 @@ impl<'a> PolygonRenderer<'a> {
 		#version 430
 
 		in vec2 position;
-		in vec4 color_rgba;
+		in uvec4 color_rgba;
 
 		out vec4 color_in;
 
 		void main() {
-			color_in = color_rgba;
+			color_in = vec4(color_rgba) / 255;
 			gl_Position = vec4(position, 0.0, 1.0);
 		}
 	"#;
@@ -412,12 +414,14 @@ impl<'a> PolygonRenderer<'a> {
 		.unwrap()
 	}
 
+	#[inline]
 	fn update_polygon(&mut self, base: usize, polygons: &[Vertex]) {
 		let slice = self.vbo.slice(base..(base + 3)).unwrap();
 		slice.invalidate();
 		slice.write(polygons);
 	}
 
+	#[inline]
 	fn clear_draw_polygons(&self, target: &mut glium::framebuffer::SimpleFrameBuffer) {
 		target.clear_color(1.0, 1.0, 1.0, 1.0);
 		target
@@ -434,6 +438,7 @@ impl<'a> PolygonRenderer<'a> {
 			.unwrap();
 	}
 
+	#[inline]
 	fn calculate_loss(&self, current: &glium::texture::Texture2d) -> f32 {
 		self.compute_program
 			.compute_loss(current, self.reference_image)
@@ -454,14 +459,8 @@ fn build_image_buffer(
 	image_buffer
 }
 
-enum MutationResult {
-	Good,
-	Bad,
-}
-
 struct Population {
 	members: Vec<Vertex>,
-	// mutation_backup: Option<Vec<Vertex>>,
 	mutation_backup: Option<(usize, [Vertex; 3])>,
 	rand: FastRand,
 }
@@ -475,6 +474,7 @@ impl Population {
 		}
 	}
 
+	#[inline]
 	fn mutate_color(&mut self, base: usize) {
 		let v123 = &mut self.members[base..(base + 3)];
 
@@ -486,6 +486,7 @@ impl Population {
 		v123[2].color_rgba[(rnd % 3) as usize] = rnd_a;
 	}
 
+	#[inline]
 	fn mutate_coord(&mut self, base: usize) {
 		let v123 = &mut self.members[base..(base + 3)];
 
@@ -496,6 +497,7 @@ impl Population {
 		v123[(rnd % 3) as usize].position[(rnd_a % 2) as usize] = rnd_f * 2.0 - 1.0;
 	}
 
+	#[inline]
 	fn mutate_alpha(&mut self, base: usize) {
 		let v123 = &mut self.members[base..(base + 3)];
 		let rnd_a = (self.rand.rand() % 256) as u8;
@@ -505,6 +507,7 @@ impl Population {
 		v123[2].color_rgba[3] = rnd_a;
 	}
 
+	#[inline]
 	fn mutate(&mut self) -> (&[Vertex], usize) {
 		let base = self.rand.rand() as usize % (self.members.len() / 3) * 3;
 
@@ -524,6 +527,7 @@ impl Population {
 		(&self.members[base..(base + 3)], base)
 	}
 
+	#[inline]
 	fn restore(&mut self) -> (&[Vertex], usize) {
 		if let Some(backup) = self.mutation_backup.take() {
 			self.members[backup.0..(backup.0 + 3)].copy_from_slice(&backup.1);
@@ -709,12 +713,12 @@ impl IdentityDrawer {
 }
 
 fn main() {
-	const WIDTH: u32 = 256;
-	const HEIGHT: u32 = 256;
+	const WIDTH: u32 = 512;
+	const HEIGHT: u32 = 512;
 
 	let event_loop = glutin::event_loop::EventLoop::new();
 	let wb = glutin::window::WindowBuilder::new()
-		.with_visible(true)
+		.with_visible(false)
 		.with_inner_size(glutin::dpi::PhysicalSize::new(WIDTH, HEIGHT));
 	let cb = glutin::ContextBuilder::new();
 	let display = glium::Display::new(wb, cb, &event_loop).unwrap();
@@ -722,7 +726,7 @@ fn main() {
 	let reference_image = load_file_to_texutre(&display, "input.png");
 	let reference_image = texture_to_scale(&display, &reference_image, WIDTH, HEIGHT);
 
-	let mut population = Population::random(50);
+	let mut population = Population::random(256);
 
 	let mut renderer = PolygonRenderer::build(
 		&display,
@@ -738,21 +742,20 @@ fn main() {
 
 	renderer.clear_draw_polygons(&mut framebuffer);
 
+	let initial_loss = renderer.calculate_loss(&texture);
 	let mut current_loss = renderer.calculate_loss(&texture);
 	let mut good_mutations = 0;
 	let mut bad_mutations = 0;
-	for i in 0..100000 {
+
+	let mut timestamp = std::time::Instant::now();
+	let loss_cutoff_percentage = 0.91;
+	for i in 0..40000 {
 		let (mutated_vertices, base) = population.mutate();
 
-		// let fence = glium::SyncFence::new(&display).unwrap();
 		renderer.update_polygon(base, mutated_vertices);
 		renderer.clear_draw_polygons(&mut framebuffer);
-		// fence.wait();
 
-		// let fence = glium::SyncFence::new(&display).unwrap();
 		let loss = renderer.calculate_loss(&texture);
-		// fence.wait();
-		// thread::sleep(Duration::from_secs(1));
 
 		if loss > current_loss {
 			let (restored_vertices, base) = population.restore();
@@ -761,117 +764,37 @@ fn main() {
 		} else {
 			current_loss = loss;
 			good_mutations += 1;
-			// let image_buffer = build_image_buffer(&texture);
-			// image_buffer.save(format!("test{i}.png")).unwrap();
+
+			let t2 = std::time::Instant::now();
+			if (t2 - timestamp).as_secs() > 2 {
+				timestamp = t2;
+				println!(
+					"gen: {i}, loss: {current_loss}, similarity: {:.1}%",
+					((initial_loss - current_loss) / initial_loss) * 100.0
+				);
+			}
+
+			if ((initial_loss - current_loss) / initial_loss) >= loss_cutoff_percentage {
+				break;
+			}
+
+			// let mut frame = display.draw();
+			// frame.clear_color(1.0, 1.0, 1.0, 1.0);
+			// // identity_drawer.draw_texture(&mut frame, &reference_image);
+			// identity_drawer.draw_texture(&mut frame, &texture);
+			// frame.finish().unwrap();
+
+			// display
+			// 	.gl_window()
+			// 	.window()
+			// 	.set_title(&format!("gen: {i}, loss: {current_loss}"));
 		}
-
-		// println!("loss: {loss}, good: {good_mutations}, bad: {bad_mutations}");
-
-		let mut frame = display.draw();
-		frame.clear_color(1.0, 1.0, 1.0, 1.0);
-		// identity_drawer.draw_texture(&mut frame, &reference_image);
-		identity_drawer.draw_texture(&mut frame, &texture);
-		frame.finish().unwrap();
-
-		display
-			.gl_window()
-			.window()
-			.set_title(&format!("gen: {i}, loss: {current_loss}"));
-
-		// thread::sleep(Duration::from_millis(10));
-		// println!("loss: {}", loss);
 	}
+	let image_buffer = build_image_buffer(&texture);
+	image::DynamicImage::ImageRgba8(image_buffer)
+		.flipv()
+		.save("output.png")
+		.unwrap();
 
-	// let shape = gen_vertices(128);
-
-	// println!("shape: {:?}", shape.len());
-
-	// let texture = glium::texture::Texture2d::empty_with_format(
-	// 	&display,
-	// 	glium::texture::UncompressedFloatFormat::U8U8U8U8,
-	// 	glium::texture::MipmapsOption::NoMipmap,
-	// 	1024,
-	// 	1024,
-	// )
-	// .unwrap();
-
-	// let texture_unit = texture
-	// 	.image_unit(glium::uniforms::ImageUnitFormat::RGBA8)
-	// 	.unwrap()
-	// 	.set_access(glium::uniforms::ImageUnitAccess::ReadWrite);
-
-	// let program =
-	// 	glium::Program::from_source(&display, vertex_shader_src, fragment_shader_src, None)
-	// 		.unwrap();
-
-	// println!("initialized");
-
-	// // for i in 0..1 {
-	// {
-	// 	let t1 = std::time::Instant::now();
-
-	// 	let mut target = texture.as_surface(); //display.draw();
-	// 	target.clear_color(0.0, 0.0, 0.0, 0.0);
-	// 	target
-	// 		.draw(
-	// 			&vbo,
-	// 			indices,
-	// 			&program,
-	// 			// &glium::uniforms::EmptyUniforms,
-	// 			&glium::uniform! {
-	// 				tex: texture_unit,
-	// 			},
-	// 			&glium::DrawParameters {
-	// 				blend: glium::Blend::alpha_blending(),
-	// 				..Default::default()
-	// 			},
-	// 		)
-	// 		.unwrap();
-
-	// 	// target.finish().unwrap();
-
-	// 	// let target = display.draw();
-	// 	// 	.as_surface()
-	// 	// 	.fill(&target, glium::uniforms::MagnifySamplerFilter::Nearest);
-
-	// 	// target.finish().unwrap();
-
-	// 	let t2 = std::time::Instant::now();
-
-	// 	let new_vertices = gen_vertices(128);
-	// 	vbo.write(&new_vertices);
-
-	// 	let t3 = std::time::Instant::now();
-
-	// 	let pixels: Vec<Vec<(u8, u8, u8, u8)>> = texture.read(); //display.read_front_buffer().unwrap();
-
-	// 	let mut image_buffer = image::ImageBuffer::new(pixels[0].len() as u32, pixels.len() as u32);
-	// 	for (x, y, pixel) in image_buffer.enumerate_pixels_mut() {
-	// 		let (r, g, b, a) = pixels[y as usize][x as usize];
-	// 		*pixel = image::Rgba([r, g, b, a]);
-	// 	}
-
-	// 	// let a = image_buffer
-	// 	// 	.enumerate_pixels()
-	// 	// 	.filter(|(x, y, p)| p != &&image::Rgba::<u8>([0, 0, 0, 255]))
-	// 	// 	.count();
-
-	// 	// println!("pixels: {}", a);
-
-	// 	let t4 = std::time::Instant::now();
-
-	// 	image_buffer.save(format!("output/image{}.png", 1)).unwrap();
-
-	// 	let t5 = std::time::Instant::now();
-
-	// 	println!(
-	// 		"gen image draw:{:?}, upd:{:?}, buf:{:?}, write:{:?}",
-	// 		t2 - t1,
-	// 		t3 - t2,
-	// 		t4 - t3,
-	// 		t5 - t4
-	// 	);
-	// }
-
-	// println!("rendered");
+	println!("initial loss: {initial_loss}, loss: {current_loss}, good: {good_mutations}, bad: {bad_mutations}");
 }
