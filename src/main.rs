@@ -206,6 +206,10 @@ impl FastRand {
 		self.hasher.write_u64(val);
 		val
 	}
+
+	fn randnormfloat(&mut self) -> f32 {
+		(self.rand() % 100000) as f32 / 100000.0
+	}
 }
 
 fn gen_vertices(n_triangles: usize) -> Vec<Vertex> {
@@ -219,11 +223,11 @@ fn gen_vertices(n_triangles: usize) -> Vec<Vertex> {
 		let y = ((h.rand() % 200000) as i64 - 100000) as f32 / 100000.0;
 		if i % 3 == 0 {
 			color = [
+				// todo: move to randnormfloat()
 				(h.rand() % 100000) as f32 / 100000.0,
 				(h.rand() % 100000) as f32 / 100000.0,
 				(h.rand() % 100000) as f32 / 100000.0,
-				// (h.rand() % 100000) as f32 / 100000.0,
-				0.8,
+				(h.rand() % 100000) as f32 / 100000.0,
 			];
 		}
 		let vertex = Vertex {
@@ -259,15 +263,16 @@ impl LossComputeProgram {
 			float sq_diff;
 		};
 
-		layout(rgba16f) readonly uniform image2D current_image;
-		layout(rgba16f) readonly uniform image2D reference_image;
+		layout(rgba8) readonly uniform image2D current_image;
+		layout(rgba8) readonly uniform image2D reference_image;
 
 		void main() {
 			// why does imageLoad accept ivec and not uvec?
 
 			vec4 rgba = imageLoad(current_image, ivec2(gl_GlobalInvocationID.xy));
 			vec4 ref_rgba = imageLoad(reference_image, ivec2(gl_GlobalInvocationID.xy));
-			sq_diff = dot(rgba - ref_rgba, rgba - ref_rgba);
+			float diff = dot(ref_rgba.rgb - rgba.rgb, vec3(1, 1, 1));
+			sq_diff += diff * diff;
 		}
 	"#;
 
@@ -290,14 +295,17 @@ impl LossComputeProgram {
 		assert!(w == reference.width());
 		assert!(h == reference.height());
 
-		self.uniform_buffer.write(&DiffComputeOutput { sq_diff: 0.0 });
+		self.uniform_buffer
+			.write(&DiffComputeOutput { sq_diff: 0.0 });
 		let uniforms = glium::uniform! {
 			Output: &self.uniform_buffer,
-			current_image: current,
-			reference_image: reference,
+			current_image: current.image_unit(glium::uniforms::ImageUnitFormat::RGBA8).unwrap(),
+			reference_image: reference.image_unit(glium::uniforms::ImageUnitFormat::RGBA8).unwrap(),
 		};
 
 		self.compute_program.execute(uniforms, w, h, 1);
+
+		self.uniform_buffer.read().unwrap().sq_diff
 	}
 }
 
@@ -367,7 +375,7 @@ impl<'a> PolygonRenderer<'a> {
 	fn gen_texture(&self) -> glium::Texture2d {
 		glium::texture::Texture2d::empty_with_format(
 			self.display,
-			glium::texture::UncompressedFloatFormat::F16F16F16F16,
+			glium::texture::UncompressedFloatFormat::U8U8U8U8,
 			glium::texture::MipmapsOption::NoMipmap,
 			self.width,
 			self.height,
@@ -398,28 +406,9 @@ impl<'a> PolygonRenderer<'a> {
 			.unwrap();
 	}
 
-	fn calculate_loss(&self, target: &glium::texture::Texture2d) -> f32 {
-		let mut output_buffer =
-			glium::uniforms::UniformBuffer::<DiffComputeOutput>::empty(self.display).unwrap();
-
-		let compute_uniforms = glium::uniform! {
-			Output: &output_buffer,
-			current_image: target,
-			reference_image: &self.reference_image,
-		};
-
+	fn calculate_loss(&self, current: &glium::texture::Texture2d) -> f32 {
 		self.compute_program
-			.compute_program
-			.execute(
-				&compute_uniforms,
-				[1, 1, 1],
-				&mut output_buffer,
-				&mut glium::framebuffer::SimpleFrameBuffer::new(self.display, &self.gen_texture())
-					.unwrap(),
-			)
-			.unwrap();
-
-		output_buffer.read().sq_diff
+			.compute_loss(current, &self.reference_image)
 	}
 }
 
@@ -437,8 +426,15 @@ fn build_image_buffer(
 	image_buffer
 }
 
+enum MutationResult {
+	Good,
+	Bad,
+}
+
 struct Population {
 	members: Vec<Vertex>,
+	// mutation_backup: Option<Vec<Vertex>>,
+	mutation_backup: Option<(usize, [Vertex; 3])>,
 	rand: FastRand,
 }
 
@@ -446,40 +442,182 @@ impl Population {
 	fn random(size: usize) -> Self {
 		Population {
 			members: gen_vertices(size),
+			mutation_backup: None,
 			rand: FastRand::new(),
 		}
 	}
 
-	fn mutate(&mut self) {
+	fn mutate(&mut self) -> &Vec<Vertex> {
 		let base = self.rand.rand() as usize % (self.members.len() / 3) * 3;
-		println!("base: {}", base);
-		self.members[base..(base + 3)].copy_from_slice(&gen_vertices(1))
+		let v123: &mut [Vertex; 3] = &mut self.members[base..(base + 3)].try_into().unwrap();
+
+		self.mutation_backup = Some((base, *v123));
+
+		v123.copy_from_slice(&gen_vertices(1));
+
+		// let [v1, v2, v3] = v123;
+
+		// let judgement = self.rand.rand() % 10;
+		// let mentjudge = (self.rand.rand() % 3) as usize;
+		// let f = self.rand.randnormfloat();
+		// if judgement <= 2 {
+		// 	v1.color_rgba[mentjudge] = f;
+		// 	v2.color_rgba[mentjudge] = f;
+		// 	v3.color_rgba[mentjudge] = f;
+		// } else {
+		// 	let third = (self.rand.rand() % 2) as usize;
+		// 	v123[mentjudge].position[third] = f * 2.0 - 1.0;
+		// }
+
+		&self.members
 	}
+
+	fn restore(&mut self) {
+		if let Some(backup) = self.mutation_backup.take() {
+			self.members[backup.0..(backup.0 + 3)].copy_from_slice(&backup.1);
+			self.mutation_backup = None;
+		} else {
+			unreachable!("restore called without backup");
+		}
+	}
+
+	// fn mutate(&mut self) -> &Vec<Vertex> {
+	// 	for chunk in self.members.chunks_exact_mut(3) {
+	// 		let rnd = self.rand.rand() % 10;
+	// 		if rnd <= 3 {
+	// 			let v = gen_vertices(1);
+	// 			chunk[0] = v[0];
+	// 			chunk[1] = v[1];
+	// 			chunk[2] = v[2];
+	// 		}
+	// 	}
+
+	// 	self.mutation_backup = Some(self.members.clone());
+
+	// 	&self.members
+	// }
+
+	// fn restore(&mut self) {
+	// 	if let Some(backup) = self.mutation_backup.take() {
+	// 		self.members = backup;
+	// 	} else {
+	// 		unreachable!("restore called without backup");
+	// 	}
+	// }
 }
 
-fn main() {
+fn prepare_gl_context(width: u32, height: u32) -> glium::Display {
 	let event_loop = glutin::event_loop::EventLoop::new();
 	let wb = glutin::window::WindowBuilder::new()
 		.with_visible(false)
-		.with_inner_size(glutin::dpi::PhysicalSize::new(1000.0, 1000.0));
+		.with_inner_size(glutin::dpi::PhysicalSize::new(width, height));
 	let cb = glutin::ContextBuilder::new();
-	let display = glium::Display::new(wb, cb, &event_loop).unwrap();
+	glium::Display::new(wb, cb, &event_loop).unwrap()
+}
 
-	let mut population = Population::random(3);
+fn load_file_to_texutre(
+	display: &glium::Display,
+	path: impl AsRef<Path>,
+) -> glium::texture::Texture2d {
+	let image = image::open(path).unwrap().to_rgba8();
+	let image_dimensions = image.dimensions();
+	let image = glium::texture::RawImage2d::from_raw_rgba(image.into_raw(), image_dimensions);
+	glium::texture::Texture2d::new(display, image).unwrap()
+}
 
-	let mut renderer = PolygonRenderer::build(&display, 1000, 1000, 1024);
+fn texture_to_scale(
+	display: &glium::Display,
+	src: &glium::Texture2d,
+	dest_width: u32,
+	dest_height: u32,
+) -> glium::Texture2d {
+	let passthrough_compute = r#"
+		#version 430
+
+		layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+		uniform sampler2D tex;
+
+		layout(rgba8) writeonly uniform image2D outImage;
+
+		void main() {
+			uint x = gl_GlobalInvocationID.x;
+			uint y = gl_GlobalInvocationID.y;
+			ivec2 size = textureSize(tex, 0);
+
+			vec4 color = texture(tex, vec2(x, y) / gl_NumWorkGroups.xy);
+
+			imageStore(outImage, ivec2(x, y), color);
+		}
+	"#;
+
+	let program = glium::program::ComputeShader::from_source(display, passthrough_compute).unwrap();
+
+	let dest_texture = glium::texture::Texture2d::empty_with_format(
+		display,
+		glium::texture::UncompressedFloatFormat::U8U8U8U8,
+		glium::texture::MipmapsOption::NoMipmap,
+		dest_width,
+		dest_height,
+	)
+	.unwrap();
+
+	let dest_texture_unit = dest_texture
+		.image_unit(glium::uniforms::ImageUnitFormat::RGBA8)
+		.unwrap();
+
+	let t1 = std::time::Instant::now();
+	program.execute(
+		glium::uniform! {
+			tex: src.sampled().magnify_filter(glium::uniforms::MagnifySamplerFilter::Nearest),
+			outImage: dest_texture_unit
+		},
+		dest_width,
+		dest_height,
+		1,
+	);
+	let t2 = std::time::Instant::now();
+	println!("time: {:?}", t2 - t1);
+
+	dest_texture
+}
+
+fn main() {
+	const WIDTH: u32 = 256;
+	const HEIGHT: u32 = 256;
+	let display = prepare_gl_context(WIDTH, HEIGHT);
+
+	let reference_image = load_file_to_texutre(&display, "input.png");
+	let reference_image = texture_to_scale(&display, &reference_image, WIDTH, HEIGHT);
+
+	let mut population = Population::random(256);
+
+	let mut renderer = PolygonRenderer::build(&display, WIDTH, HEIGHT, 256, reference_image);
 	let texture = renderer.gen_texture();
 	let mut framebuffer = texture.as_surface();
 
-	for _ in 0..2 {
-		renderer.update_polygons(&population.members);
+	renderer.update_polygons(&population.members);
+	renderer.clear_draw_polygons(&mut framebuffer);
+
+	let mut current_loss = renderer.calculate_loss(&texture);
+	for i in 0..100000 {
+		let mutated_population = population.mutate();
+
+		renderer.update_polygons(mutated_population);
 		renderer.clear_draw_polygons(&mut framebuffer);
 
-		population.mutate();
+		let loss = renderer.calculate_loss(&texture);
+
+		if loss > current_loss {
+			population.restore();
+		} else {
+			current_loss = loss;
+			let image_buffer = build_image_buffer(&texture);
+			image_buffer.save(format!("test{i}.png")).unwrap();
+			println!("loss: {}", loss);
+		}
 	}
 
-	let image_buffer = build_image_buffer(&texture);
-	image_buffer.save("test.png").unwrap();
 
 	// let shape = gen_vertices(128);
 
