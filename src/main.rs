@@ -1,27 +1,13 @@
-use std::{
-	borrow::Cow,
-	fmt::Debug,
-	fs,
-	io::Cursor,
-	path::{Path, PathBuf},
-	sync::Arc,
-	thread,
-};
+use std::fs;
+use std::{fmt::Debug, path::Path};
 
-use egui::{Color32, ColorImage, ImageData, Pos2, Rect, Stroke, TextureHandle, Vec2};
 use std::{
 	collections::hash_map::{DefaultHasher, RandomState},
 	hash::{BuildHasher, Hasher},
-	mem::MaybeUninit,
-	ptr::addr_of_mut,
-	time::Duration,
 };
 
-use glium::{
-	framebuffer, glutin, implement_uniform_block, implement_vertex, texture::UnsignedTexture2d,
-	Surface,
-};
-use rand::{prelude::Distribution, Rng};
+use glium::{glutin, implement_vertex, Surface};
+use rand::prelude::Distribution;
 
 // #[derive(Debug, Clone, Copy)]
 // enum ImageType {
@@ -225,12 +211,10 @@ fn gen_vertices(n_triangles: usize) -> Vec<Vertex> {
 		let y = ((h.rand() % 200000) as i64 - 100000) as f32 / 100000.0;
 		if i % 3 == 0 {
 			color = [
-				// todo: move to randnormfloat()
-				// (h.rand() % 100000) as f32 / 100000.0,
-				// (h.rand() % 100000) as f32 / 100000.0,
-				// (h.rand() % 100000) as f32 / 100000.0,
-				// (h.rand() % 100000) as f32 / 100000.0,
-				0, 0, 0, 255,
+				(h.rand() % 256) as u8,
+				(h.rand() % 256) as u8,
+				(h.rand() % 256) as u8,
+				(h.rand() % 256) as u8,
 			];
 		}
 
@@ -276,19 +260,9 @@ impl LossComputeProgram {
 		void main() {
 			// why does imageLoad accept ivec and not uvec?
 
-			// uvec4 rgba = uvec4(imageLoad(current_image, ivec2(gl_GlobalInvocationID.xy)) * 100.0);
-			// uvec4 ref_rgba = uvec4(imageLoad(reference_image, ivec2(gl_GlobalInvocationID.xy)) * 100.0);
-
             vec3 rgba = imageLoad(current_image, ivec2(gl_GlobalInvocationID.xy)).rgb;
             vec3 ref_rgba = imageLoad(reference_image, ivec2(gl_GlobalInvocationID.xy)).rgb;
             vec3 diff = rgba - ref_rgba;
-
-            // uint rd = rgba.r - ref_rgba.r;
-            // uint gd = rgba.g - ref_rgba.g;
-            // uint bd = rgba.b - ref_rgba.b;
-            // atomicAdd(sq_diff, rd * rd + gd * gd + bd * bd);
-
-            // atomicAdd(sq_diff, uint(dot(diff, diff) * 100));
 
             imageStore(diff_texture, ivec2(gl_GlobalInvocationID.xy), vec4(dot(diff, diff)));
 		}
@@ -423,7 +397,7 @@ impl<'a> PolygonRenderer<'a> {
 
 	#[inline]
 	fn clear_draw_polygons(&self, target: &mut glium::framebuffer::SimpleFrameBuffer) {
-		target.clear_color(1.0, 1.0, 1.0, 1.0);
+		target.clear_color(0.6, 0.6, 0.6, 1.0);
 		target
 			.draw(
 				&self.vbo,
@@ -562,6 +536,7 @@ fn texture_to_scale(
 	src: &glium::Texture2d,
 	dest_width: u32,
 	dest_height: u32,
+	srgb: bool,
 ) -> glium::Texture2d {
 	let passthrough_compute = r#"
 		#version 440
@@ -569,6 +544,7 @@ fn texture_to_scale(
 		layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 
 		uniform sampler2D tex;
+        uniform bool srgb;
 
 		layout(rgba8) writeonly uniform image2D outImage;
 
@@ -578,6 +554,10 @@ fn texture_to_scale(
 			ivec2 size = textureSize(tex, 0);
 
 			vec4 color = texture(tex, vec2(x, y) / gl_NumWorkGroups.xy);
+
+            // if (srgb) {
+            //     color.rgb = pow(color.rgb, vec3(1.0 / 2.2));
+            // }
 
 			imageStore(outImage, ivec2(x, y), color);
 		}
@@ -602,7 +582,8 @@ fn texture_to_scale(
 	program.execute(
 		glium::uniform! {
 			tex: src.sampled().magnify_filter(glium::uniforms::MagnifySamplerFilter::Nearest),
-			outImage: dest_texture_unit
+			outImage: dest_texture_unit,
+			srgb: srgb,
 		},
 		dest_width,
 		dest_height,
@@ -713,8 +694,8 @@ impl IdentityDrawer {
 }
 
 fn main() {
-	const WIDTH: u32 = 512;
-	const HEIGHT: u32 = 512;
+	const WIDTH: u32 = 500;
+	const HEIGHT: u32 = 500;
 
 	let event_loop = glutin::event_loop::EventLoop::new();
 	let wb = glutin::window::WindowBuilder::new()
@@ -724,9 +705,9 @@ fn main() {
 	let display = glium::Display::new(wb, cb, &event_loop).unwrap();
 
 	let reference_image = load_file_to_texutre(&display, "input.png");
-	let reference_image = texture_to_scale(&display, &reference_image, WIDTH, HEIGHT);
+	let reference_image = texture_to_scale(&display, &reference_image, WIDTH, HEIGHT, false);
 
-	let mut population = Population::random(256);
+	let mut population = Population::random(512);
 
 	let mut renderer = PolygonRenderer::build(
 		&display,
@@ -739,6 +720,7 @@ fn main() {
 	let mut framebuffer = texture.as_surface();
 
 	let identity_drawer = IdentityDrawer::new(&display);
+    // let gray_texture = texture_to_scale(&display, &load_file_to_texutre(&display, "gray.png"), WIDTH, HEIGHT, false);
 
 	renderer.clear_draw_polygons(&mut framebuffer);
 
@@ -747,9 +729,11 @@ fn main() {
 	let mut good_mutations = 0;
 	let mut bad_mutations = 0;
 
-	let mut timestamp = std::time::Instant::now();
-	let loss_cutoff_percentage = 0.91;
-	for i in 0..40000 {
+	let initial_timestamp = std::time::Instant::now();
+	let mut timestamp = initial_timestamp;
+	let loss_cutoff_percentage = 0.92;
+	// let mut loss_history = Vec::new();
+	for i in 0.. {
 		let (mutated_vertices, base) = population.mutate();
 
 		renderer.update_polygon(base, mutated_vertices);
@@ -766,11 +750,23 @@ fn main() {
 			good_mutations += 1;
 
 			let t2 = std::time::Instant::now();
-			if (t2 - timestamp).as_secs() > 2 {
+			if (t2 - timestamp).as_secs_f32() > 1.75 {
+				// loss_history.push((
+				// 	(t2 - initial_timestamp).as_secs_f32(),
+				// 	// (initial_loss - current_loss) / initial_loss,
+				// 	current_loss,
+				// ));
+
+				let image_buffer = build_image_buffer(&texture);
+				image::DynamicImage::ImageRgba8(image_buffer)
+					.flipv()
+					.save(format!("output/gen_{i}.png"))
+					.unwrap();
+
 				timestamp = t2;
 				println!(
 					"gen: {i}, loss: {current_loss}, similarity: {:.1}%",
-					((initial_loss - current_loss) / initial_loss) * 100.0
+					((initial_loss - current_loss) / initial_loss) * 100.0,
 				);
 			}
 
@@ -790,11 +786,26 @@ fn main() {
 			// 	.set_title(&format!("gen: {i}, loss: {current_loss}"));
 		}
 	}
-	let image_buffer = build_image_buffer(&texture);
-	image::DynamicImage::ImageRgba8(image_buffer)
-		.flipv()
-		.save("output.png")
-		.unwrap();
 
-	println!("initial loss: {initial_loss}, loss: {current_loss}, good: {good_mutations}, bad: {bad_mutations}");
+	// fs::write(
+	// 	"loss_history.csv",
+	// 	loss_history
+	// 		.into_iter()
+	// 		.fold("TimeX,LossLogFY\n".to_string(), |mut acc, (x, y)| {
+	// 			acc.push_str(&format!("{},{}\n", x.log2(), y.log2()));
+	// 			acc
+	// 		}),
+	// )
+	// .unwrap();
+
+	let time_taken = initial_timestamp.elapsed();
+	let mut time_taken_millis = time_taken.as_millis();
+	let ms = time_taken_millis % 1000;
+	time_taken_millis /= 1000;
+	let s = time_taken_millis % 60;
+	time_taken_millis /= 60;
+	let m = time_taken_millis % 60;
+	let h = (time_taken_millis - m) / 60;
+
+	println!("initial loss: {initial_loss}, loss: {current_loss}, good: {good_mutations}, bad: {bad_mutations}, time take: {h}:{m}:{s}.{ms}");
 }
